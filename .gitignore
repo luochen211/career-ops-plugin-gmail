@@ -1,0 +1,7 @@
+.env
+.env.*
+node_modules/
+data/
+batch/
+*.log
+.DS_Store

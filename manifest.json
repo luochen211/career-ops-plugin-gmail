@@ -1,0 +1,13 @@
+{
+  "id": "gmail",
+  "name": "Gmail leads and reply review",
+  "version": "1.1.0",
+  "apiVersion": 1,
+  "description": "Read Gmail job leads and surface employer replies for human review.",
+  "hooks": ["ingest"],
+  "requiredEnv": ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"],
+  "allowedHosts": ["oauth2.googleapis.com", "gmail.googleapis.com"],
+  "skill": "skill.md",
+  "humanInTheLoop": true,
+  "homepage": "https://github.com/luochen211/career-ops-plugin-gmail"
+}
