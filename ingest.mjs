@@ -29,7 +29,7 @@ const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const STATE_PATH = 'data/gmail-state.json'; // the plugin's own processed-id cursor
 
 /** Exchange the long-lived refresh token for a short-lived access token. */
-async function getAccessToken({ clientId, clientSecret, refreshToken }, fetchFn = globalThis.fetch) {
+async function getAccessToken({ clientId, clientSecret, refreshToken }, fetchFn) {
   const res = await fetchFn(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -41,7 +41,7 @@ async function getAccessToken({ clientId, clientSecret, refreshToken }, fetchFn 
     }),
   });
   if (!res.ok) {
-    throw new Error(`Gmail token refresh failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    throw new Error(`Gmail token refresh failed: HTTP ${res.status}`);
   }
   const data = await res.json();
   if (!data.access_token) throw new Error('Gmail token refresh returned no access_token');
@@ -70,6 +70,7 @@ function saveProcessedIds(ids) {
 /** @type {{ ingest: (ctx: any) => Promise<object[]> }} */
 export default {
   async ingest(ctx) {
+    if (typeof ctx?.fetch !== 'function') throw new Error('gmail: scoped ctx.fetch is required');
     const clientId = ctx?.env?.GMAIL_CLIENT_ID;
     const clientSecret = ctx?.env?.GMAIL_CLIENT_SECRET;
     const refreshToken = ctx?.env?.GMAIL_REFRESH_TOKEN;

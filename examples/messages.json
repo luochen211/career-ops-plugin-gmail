@@ -1,0 +1,80 @@
+{
+  "applications": [
+    { "num": 7, "company": "Example Labs", "role": "Backend Engineer", "recruiter_emails": ["hiring@example.test"] },
+    { "num": 8, "company": "示例科技", "role": "数据分析师", "recruiter_emails": ["hiring@fictional.example.test"] }
+  ],
+  "messages": [
+    {
+      "id": "fixture_en_interview", "threadId": "thread_en_interview", "internalDate": "1780000000000",
+      "snippet": "We would like to invite you to an interview for Backend Engineer at Example Labs.",
+      "payload": { "headers": [
+        { "name": "From", "value": "Example Recruiting <hiring@example.test>" },
+        { "name": "Subject", "value": "Example Labs — Backend Engineer application" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_en_rejection", "threadId": "thread_en_rejection", "internalDate": "1780000001000",
+      "snippet": "Thank you for applying to Example Labs. We have decided not to move forward with your application for Backend Engineer.",
+      "payload": { "headers": [
+        { "name": "From", "value": "Example Recruiting <hiring@example.test>" },
+        { "name": "Subject", "value": "Example Labs — Backend Engineer update" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_en_offer", "threadId": "thread_en_offer", "internalDate": "1780000002000",
+      "snippet": "Example Labs is pleased to share an update. We are pleased to offer you the position of Backend Engineer.",
+      "payload": { "headers": [
+        { "name": "From", "value": "Example Recruiting <hiring@example.test>" },
+        { "name": "Subject", "value": "Example Labs — Backend Engineer offer" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_zh_interview", "threadId": "thread_zh_interview", "internalDate": "1780000003000",
+      "snippet": "感谢您应聘示例科技数据分析师。邀请您参加技术面试，请回复可参加的时间。",
+      "payload": { "headers": [
+        { "name": "From", "value": "示例招聘 <hiring@fictional.example.test>" },
+        { "name": "Subject", "value": "示例科技数据分析师面试通知" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=fictional.example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_zh_rejection", "threadId": "thread_zh_rejection", "internalDate": "1780000004000",
+      "snippet": "感谢您应聘示例科技数据分析师。很遗憾通知您，本轮未能进入下一阶段。",
+      "payload": { "headers": [
+        { "name": "From", "value": "示例招聘 <hiring@fictional.example.test>" },
+        { "name": "Subject", "value": "示例科技数据分析师申请结果" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=fictional.example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_zh_offer", "threadId": "thread_zh_offer", "internalDate": "1780000005000",
+      "snippet": "示例科技向您正式发出数据分析师录用通知。请您阅读通知后回复。",
+      "payload": { "headers": [
+        { "name": "From", "value": "示例招聘 <hiring@fictional.example.test>" },
+        { "name": "Subject", "value": "示例科技数据分析师录用通知" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=fictional.example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_en_marketing", "threadId": "thread_en_marketing", "internalDate": "1780000006000",
+      "snippet": "Recommended jobs at Example Labs. Apply now for Backend Engineer and read our interview tips newsletter.",
+      "payload": { "headers": [
+        { "name": "From", "value": "Example Job Alerts <alerts@example.test>" },
+        { "name": "Subject", "value": "Jobs for you: Example Labs" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=example.test" }
+      ] }
+    },
+    {
+      "id": "fixture_zh_marketing", "threadId": "thread_zh_marketing", "internalDate": "1780000007000",
+      "snippet": "示例科技热招数据分析师，邀请投递！立即投递，阅读面试技巧，抢面试先机。",
+      "payload": { "headers": [
+        { "name": "From", "value": "示例职位推荐 <alerts@fictional.example.test>" },
+        { "name": "Subject", "value": "示例科技热门职位推荐" },
+        { "name": "Authentication-Results", "value": "mx.google.com; dmarc=pass header.from=fictional.example.test" }
+      ] }
+    }
+  ]
+}

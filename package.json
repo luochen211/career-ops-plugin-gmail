@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },
-  "scripts": { "test": "node test/smoke.mjs" },
+  "scripts": { "test": "node test/all.mjs" },
   "license": "MIT"
 }
