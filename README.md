@@ -2,7 +2,7 @@
 
 Independent, opt-in Gmail integration for career-ops, maintained by @luochen211.
 Starts from career-ops' MIT-licensed bundled Gmail reference seed at
-`d6a6c12`, originally contributed by @SparshGarg999 in #1203.
+`7933fb3`, originally contributed by @SparshGarg999 in #1203.
 
 The default `ingest` hook reads job leads from a configured label and returns
 `Job[]` for career-ops to add to its pipeline. OAuth credentials arrive only
