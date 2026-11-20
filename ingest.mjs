@@ -15,6 +15,8 @@
 //
 // Enable in config/plugins.yml:
 //   gmail: { enabled: true, label: "Job Leads", days_back: 7 }
+// Employer-reply review (opt-in, see _replies.mjs and skill.md):
+//   gmail: { enabled: true, replies: true, replies_days_back: 30 }
 // Add to .env: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN.
 // Run:  node plugins.mjs run gmail
 
@@ -24,6 +26,7 @@ import {
   extractUrls, isCleanUrl, isAuthenticEmail, parseRoleAtCompany,
   getMessageBody, companyFromUrl,
 } from './_helpers.mjs';
+import { scanReplies } from './_replies.mjs';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -105,63 +108,82 @@ export default {
       throw new Error(`gmail: invalid days_back "${ctx?.settings?.days_back}" (must be a positive integer)`);
     }
 
-    const token = await getAccessToken({ clientId, clientSecret, refreshToken }, ctx.fetch);
-    const auth = { Authorization: `Bearer ${token}` };
-    const query = `label:"${label}" newer_than:${daysBack}d`;
-    ctx.log(`gmail: querying ${query}`);
-
-    // List message ids (paginated). ctx.fetch throws on a non-2xx (with the body
-    // in the message), so a failed page surfaces a clear error.
-    const messages = [];
-    let pageToken = null;
-    do {
-      let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
-      if (pageToken) url += `&pageToken=${pageToken}`;
-      const data = await (await ctx.fetch(url, { headers: auth })).json();
-      if (data.messages) messages.push(...data.messages);
-      pageToken = data.nextPageToken;
-    } while (pageToken);
-
-    const processedIds = loadProcessedIds(ctx);
-    const seenUrls = new Set();
-    const jobs = [];
-
-    for (const m of messages) {
-      if (processedIds.has(m.id)) continue;
-      // Per-message resilience: a single bad detail fetch is skipped, not fatal.
-      let msg;
-      try {
-        msg = await (await ctx.fetch(`${GMAIL_API}/messages/${m.id}?format=full`, { headers: auth })).json();
-      } catch (err) {
-        console.warn(`gmail: failed to fetch message ${m.id} — ${err.message}`);
-        continue;
-      }
-      const headers = msg.payload?.headers || [];
-      const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
-
-      // Fail-closed on spoofed mail (DMARC).
-      if (!isAuthenticEmail(headers)) {
-        console.warn(`gmail: skipping spoofed/unauthenticated email "${subject}"`);
-        processedIds.add(m.id);
-        continue;
-      }
-
-      const seed = parseRoleAtCompany(subject);
-      const cleanUrls = extractUrls(getMessageBody(msg.payload)).filter(isCleanUrl);
-      for (const url of cleanUrls) {
-        if (seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        jobs.push({
-          title: seed?.role || 'Job lead (email)',
-          url,
-          company: companyFromUrl(url) || seed?.company || '',
-          location: '',
-        });
-      }
-      processedIds.add(m.id);
+    const leads = ctx?.settings?.leads !== false;
+    const replies = ctx?.settings?.replies === true;
+    const repliesDaysBack = Number(ctx?.settings?.replies_days_back ?? 30);
+    if (replies && (!Number.isInteger(repliesDaysBack) || repliesDaysBack <= 0)) {
+      throw new Error(`gmail: invalid replies_days_back "${ctx?.settings?.replies_days_back}" (must be a positive integer)`);
     }
 
-    if (!ctx?.dryRun) saveProcessedIds(processedIds, ctx);
+    const token = await getAccessToken({ clientId, clientSecret, refreshToken }, ctx.fetch);
+    const auth = { Authorization: `Bearer ${token}` };
+    const jobs = leads ? await ingestLeads(ctx, auth, label, daysBack) : [];
+    if (replies) {
+      await scanReplies(ctx, auth, {
+        daysBack: repliesDaysBack,
+        trackerOverride: process.env.CAREER_OPS_TRACKER?.trim() || '',
+      });
+    }
     return jobs;
   },
 };
+
+/** The original job-lead ingest: clean URLs from a label become Job[]. */
+async function ingestLeads(ctx, auth, label, daysBack) {
+  const query = `label:"${label}" newer_than:${daysBack}d`;
+  ctx.log(`gmail: querying ${query}`);
+
+  // List message ids (paginated). ctx.fetch throws on a non-2xx (with the body
+  // in the message), so a failed page surfaces a clear error.
+  const messages = [];
+  let pageToken = null;
+  do {
+    let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
+    if (pageToken) url += `&pageToken=${pageToken}`;
+    const data = await (await ctx.fetch(url, { headers: auth })).json();
+    if (data.messages) messages.push(...data.messages);
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+
+  const processedIds = loadProcessedIds(ctx);
+  const seenUrls = new Set();
+  const jobs = [];
+
+  for (const m of messages) {
+    if (processedIds.has(m.id)) continue;
+    // Per-message resilience: a single bad detail fetch is skipped, not fatal.
+    let msg;
+    try {
+      msg = await (await ctx.fetch(`${GMAIL_API}/messages/${m.id}?format=full`, { headers: auth })).json();
+    } catch (err) {
+      console.warn(`gmail: failed to fetch message ${m.id} — ${err.message}`);
+      continue;
+    }
+    const headers = msg.payload?.headers || [];
+    const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
+
+    // Fail-closed on spoofed mail (DMARC).
+    if (!isAuthenticEmail(headers)) {
+      console.warn(`gmail: skipping spoofed/unauthenticated email "${subject}"`);
+      processedIds.add(m.id);
+      continue;
+    }
+
+    const seed = parseRoleAtCompany(subject);
+    const cleanUrls = extractUrls(getMessageBody(msg.payload)).filter(isCleanUrl);
+    for (const url of cleanUrls) {
+      if (seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      jobs.push({
+        title: seed?.role || 'Job lead (email)',
+        url,
+        company: companyFromUrl(url) || seed?.company || '',
+        location: '',
+      });
+    }
+    processedIds.add(m.id);
+  }
+
+  if (!ctx?.dryRun) saveProcessedIds(processedIds, ctx);
+  return jobs;
+}
