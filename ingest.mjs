@@ -15,18 +15,35 @@
 //
 // Enable in config/plugins.yml:
 //   gmail: { enabled: true, label: "Job Leads", days_back: 7 }
+// Employer-reply review (opt-in, see _replies.mjs and skill.md):
+//   gmail: { enabled: true, replies: true, replies_days_back: 30 }
 // Add to .env: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN.
 // Run:  node plugins.mjs run gmail
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { dirname, join, resolve } from 'path';
 import {
   extractUrls, isCleanUrl, isAuthenticEmail, parseRoleAtCompany,
   getMessageBody, companyFromUrl,
 } from './_helpers.mjs';
+import { scanReplies } from './_replies.mjs';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
-const STATE_PATH = 'data/gmail-state.json'; // the plugin's own processed-id cursor
+const STATE_FILE = join('data', 'gmail-state.json'); // the plugin's own processed-id cursor
+// The engine stops an ingest hook after 15 seconds and then drops what it
+// returns. The reply scan stops starting requests at this point of the hook, so
+// the leads fetched first always come back; unread replies wait for the next run.
+export const REPLY_DEADLINE_MS = 11_000;
+
+// The cursor is user-layer data, so it lives under the data root (ctx.dataRoot)
+// like the pipeline the engine writes these leads to. A ctx that carries no
+// dataRoot comes from an engine older than the capability, and keeps the
+// working directory that engine's plugins used.
+const statePath = (ctx) => join(ctx?.dataRoot || process.cwd(), STATE_FILE);
+// Where the cursor was kept before: relative to the working directory, which is
+// the data root only when the two happen to coincide.
+const legacyStatePath = () => resolve(STATE_FILE);
 
 /** Exchange the long-lived refresh token for a short-lived access token. */
 async function getAccessToken({ clientId, clientSecret, refreshToken }, fetchFn = globalThis.fetch) {
@@ -48,20 +65,32 @@ async function getAccessToken({ clientId, clientSecret, refreshToken }, fetchFn 
   return data.access_token;
 }
 
-function loadProcessedIds() {
-  if (!existsSync(STATE_PATH)) return new Set();
+function loadProcessedIds(ctx) {
+  let path = statePath(ctx);
+  if (!existsSync(path)) {
+    // No cursor under the data root yet. Read the one an earlier version left
+    // in the working directory, so the first run after the move does not
+    // re-ingest every message it had already processed. The next save writes
+    // the data-root file, and from then on this branch is never taken. The old
+    // file is left where it is.
+    const legacy = legacyStatePath();
+    if (!existsSync(legacy)) return new Set();
+    ctx.log(`gmail: using the processed-id cursor at ${legacy}; the next save writes it to ${path}`);
+    path = legacy;
+  }
   try {
-    const state = JSON.parse(readFileSync(STATE_PATH, 'utf-8'));
+    const state = JSON.parse(readFileSync(path, 'utf-8'));
     return new Set(state.processed_message_ids || []);
   } catch {
     return new Set();
   }
 }
 
-function saveProcessedIds(ids) {
+function saveProcessedIds(ids, ctx) {
   try {
-    mkdirSync('data', { recursive: true });
-    writeFileSync(STATE_PATH, JSON.stringify({ processed_message_ids: [...ids] }, null, 2), 'utf-8');
+    const path = statePath(ctx);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ processed_message_ids: [...ids] }, null, 2), 'utf-8');
   } catch (err) {
     console.warn(`gmail: could not persist processed-id state — ${err.message}`);
   }
@@ -70,6 +99,7 @@ function saveProcessedIds(ids) {
 /** @type {{ ingest: (ctx: any) => Promise<object[]> }} */
 export default {
   async ingest(ctx) {
+    const started = Date.now();
     const clientId = ctx?.env?.GMAIL_CLIENT_ID;
     const clientSecret = ctx?.env?.GMAIL_CLIENT_SECRET;
     const refreshToken = ctx?.env?.GMAIL_REFRESH_TOKEN;
@@ -83,63 +113,90 @@ export default {
       throw new Error(`gmail: invalid days_back "${ctx?.settings?.days_back}" (must be a positive integer)`);
     }
 
-    const token = await getAccessToken({ clientId, clientSecret, refreshToken }, ctx.fetch);
-    const auth = { Authorization: `Bearer ${token}` };
-    const query = `label:"${label}" newer_than:${daysBack}d`;
-    ctx.log(`gmail: querying ${query}`);
-
-    // List message ids (paginated). ctx.fetch throws on a non-2xx (with the body
-    // in the message), so a failed page surfaces a clear error.
-    const messages = [];
-    let pageToken = null;
-    do {
-      let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
-      if (pageToken) url += `&pageToken=${pageToken}`;
-      const data = await (await ctx.fetch(url, { headers: auth })).json();
-      if (data.messages) messages.push(...data.messages);
-      pageToken = data.nextPageToken;
-    } while (pageToken);
-
-    const processedIds = loadProcessedIds();
-    const seenUrls = new Set();
-    const jobs = [];
-
-    for (const m of messages) {
-      if (processedIds.has(m.id)) continue;
-      // Per-message resilience: a single bad detail fetch is skipped, not fatal.
-      let msg;
-      try {
-        msg = await (await ctx.fetch(`${GMAIL_API}/messages/${m.id}?format=full`, { headers: auth })).json();
-      } catch (err) {
-        console.warn(`gmail: failed to fetch message ${m.id} — ${err.message}`);
-        continue;
-      }
-      const headers = msg.payload?.headers || [];
-      const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
-
-      // Fail-closed on spoofed mail (DMARC).
-      if (!isAuthenticEmail(headers)) {
-        console.warn(`gmail: skipping spoofed/unauthenticated email "${subject}"`);
-        processedIds.add(m.id);
-        continue;
-      }
-
-      const seed = parseRoleAtCompany(subject);
-      const cleanUrls = extractUrls(getMessageBody(msg.payload)).filter(isCleanUrl);
-      for (const url of cleanUrls) {
-        if (seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        jobs.push({
-          title: seed?.role || 'Job lead (email)',
-          url,
-          company: companyFromUrl(url) || seed?.company || '',
-          location: '',
-        });
-      }
-      processedIds.add(m.id);
+    const leads = ctx?.settings?.leads !== false;
+    const replies = ctx?.settings?.replies === true;
+    const repliesDaysBack = Number(ctx?.settings?.replies_days_back ?? 30);
+    if (replies && (!Number.isInteger(repliesDaysBack) || repliesDaysBack <= 0)) {
+      throw new Error(`gmail: invalid replies_days_back "${ctx?.settings?.replies_days_back}" (must be a positive integer)`);
     }
 
-    if (!ctx?.dryRun) saveProcessedIds(processedIds);
+    const token = await getAccessToken({ clientId, clientSecret, refreshToken }, ctx.fetch);
+    const auth = { Authorization: `Bearer ${token}` };
+    const jobs = leads ? await ingestLeads(ctx, auth, label, daysBack) : [];
+    if (replies) {
+      try {
+        await scanReplies(ctx, auth, {
+          daysBack: repliesDaysBack,
+          trackerOverride: process.env.CAREER_OPS_TRACKER?.trim() || '',
+          deadline: started + REPLY_DEADLINE_MS,
+        });
+      } catch (err) {
+        // The lead cursor is already saved, so throwing here would lose the
+        // leads fetched above. Keep them and report the failed reply scan.
+        if (!leads) throw err;
+        console.warn(`gmail: reply scan failed, leads kept — ${err.message}`);
+      }
+    }
     return jobs;
   },
 };
+
+/** The original job-lead ingest: clean URLs from a label become Job[]. */
+async function ingestLeads(ctx, auth, label, daysBack) {
+  const query = `label:"${label}" newer_than:${daysBack}d`;
+  ctx.log(`gmail: querying ${query}`);
+
+  // List message ids (paginated). ctx.fetch throws on a non-2xx (with the body
+  // in the message), so a failed page surfaces a clear error.
+  const messages = [];
+  let pageToken = null;
+  do {
+    let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
+    if (pageToken) url += `&pageToken=${pageToken}`;
+    const data = await (await ctx.fetch(url, { headers: auth })).json();
+    if (data.messages) messages.push(...data.messages);
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+
+  const processedIds = loadProcessedIds(ctx);
+  const seenUrls = new Set();
+  const jobs = [];
+
+  for (const m of messages) {
+    if (processedIds.has(m.id)) continue;
+    // Per-message resilience: a single bad detail fetch is skipped, not fatal.
+    let msg;
+    try {
+      msg = await (await ctx.fetch(`${GMAIL_API}/messages/${m.id}?format=full`, { headers: auth })).json();
+    } catch (err) {
+      console.warn(`gmail: failed to fetch message ${m.id} — ${err.message}`);
+      continue;
+    }
+    const headers = msg.payload?.headers || [];
+    const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
+
+    // Fail-closed on spoofed mail (DMARC).
+    if (!isAuthenticEmail(headers)) {
+      console.warn(`gmail: skipping spoofed/unauthenticated email "${subject}"`);
+      processedIds.add(m.id);
+      continue;
+    }
+
+    const seed = parseRoleAtCompany(subject);
+    const cleanUrls = extractUrls(getMessageBody(msg.payload)).filter(isCleanUrl);
+    for (const url of cleanUrls) {
+      if (seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      jobs.push({
+        title: seed?.role || 'Job lead (email)',
+        url,
+        company: companyFromUrl(url) || seed?.company || '',
+        location: '',
+      });
+    }
+    processedIds.add(m.id);
+  }
+
+  if (!ctx?.dryRun) saveProcessedIds(processedIds, ctx);
+  return jobs;
+}
