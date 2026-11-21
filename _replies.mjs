@@ -270,13 +270,32 @@ export function trackerPathFor(dataRoot, override = '') {
   try { return realpathSync(resolve(raw)); } catch { return resolve(raw); }
 }
 
+const MAX_UNMATCHED = 5000;
+// Leave this much of a request's time to the rest of the hook.
+const MIN_LEFT_MS = 500;
+
+/**
+ * processed: messages decided for good. unmatched: messages with a reply signal
+ * but no tracker row, each with the tracker digest it was last tried against;
+ * they are tried again only once the tracker has changed.
+ */
 function loadState(path) {
-  try { return new Set(JSON.parse(readFileSync(path, 'utf-8')).processed_message_ids || []); } catch { return new Set(); }
+  try {
+    const state = JSON.parse(readFileSync(path, 'utf-8'));
+    return {
+      processed: new Set(state.processed_message_ids || []),
+      unmatched: new Map(Object.entries(state.unmatched_message_ids || {})),
+    };
+  } catch { return { processed: new Set(), unmatched: new Map() }; }
 }
 
-function saveState(path, ids) {
+function saveState(path, { processed, unmatched }) {
+  const kept = [...unmatched].slice(-MAX_UNMATCHED);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify({ processed_message_ids: [...ids] }, null, 2), 'utf-8');
+  writeFileSync(path, JSON.stringify({
+    processed_message_ids: [...processed],
+    unmatched_message_ids: Object.fromEntries(kept),
+  }, null, 2), 'utf-8');
 }
 
 /** Write one proposal: temporary file, then rename into the drop directory. */
@@ -339,9 +358,13 @@ const plain = (html) => String(html).replace(/<style[\s\S]*?<\/style>|<script[\s
  * dry run.
  * @param {any} ctx plugin context
  * @param {Record<string, string>} auth Authorization header
- * @param {{ daysBack: number, trackerOverride?: string }} opts
+ * @param {{ daysBack: number, trackerOverride?: string, deadline?: number }} opts
+ *   deadline: epoch ms after which no new request starts; the rest waits for
+ *   the next run. Each request's timeout is cut to the time left.
  */
-export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' }) {
+export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '', deadline = Infinity }) {
+  const left = () => deadline - Date.now();
+  const opts = () => ({ headers: auth, timeoutMs: Math.max(1, Math.min(10_000, Math.floor(left()))) });
   const dataRoot = ctx?.dataRoot || process.cwd();
   const trackerPath = trackerPathFor(dataRoot, trackerOverride);
   if (!existsSync(trackerPath)) {
@@ -355,25 +378,34 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
     return { proposals: 0, scanned: 0 };
   }
 
-  const profile = await (await ctx.fetch(`${GMAIL_API}/profile`, { headers: auth })).json();
+  if (left() < MIN_LEFT_MS) {
+    ctx.log('gmail replies: no time left in this run; replies are scanned next run');
+    return { proposals: 0, scanned: 0 };
+  }
+  const profile = await (await ctx.fetch(`${GMAIL_API}/profile`, opts())).json();
   if (!profile.emailAddress) throw new Error('gmail replies: Gmail profile returned no address');
   const account = accountId(profile.emailAddress);
 
   const statePath = join(dataRoot, STATE_FILE);
-  const processed = loadState(statePath);
+  const state = loadState(statePath);
+  const { processed, unmatched } = state;
+  const trackerDigest = sha256(trackerText);
   const dropDir = join(dataRoot, DROP_DIR);
   const refreshed = refreshStaleProposals(ctx, { dropDir, account, rows, trackerText, trackerPath });
 
-  // The cap counts messages still to read, so processed ones never use it up.
+  // The cap counts messages still to decide: processed ones, and unmatched ones
+  // already tried against this tracker, never use it up.
   const query = buildQuery(rows, daysBack);
   const ids = [];
   let pageToken = null;
   do {
+    if (left() < MIN_LEFT_MS) break;
     let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
     if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-    const data = await (await ctx.fetch(url, { headers: auth })).json();
+    const data = await (await ctx.fetch(url, opts())).json();
     for (const m of data.messages || []) {
-      if (!processed.has(m.id) && /^[A-Za-z0-9_-]{1,256}$/.test(m.id)) ids.push(m.id);
+      if (processed.has(m.id) || unmatched.get(m.id) === trackerDigest) continue;
+      if (/^[A-Za-z0-9_-]{1,256}$/.test(m.id)) ids.push(m.id);
     }
     pageToken = data.nextPageToken;
   } while (pageToken && ids.length < MAX_MESSAGES);
@@ -382,9 +414,13 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
   let scanned = 0;
 
   for (const id of ids.slice(0, MAX_MESSAGES)) {
+    if (left() < MIN_LEFT_MS) {
+      ctx.log('gmail replies: out of time; the remaining messages are scanned next run');
+      break;
+    }
     let msg;
     try {
-      msg = await (await ctx.fetch(`${GMAIL_API}/messages/${id}?format=full`, { headers: auth })).json();
+      msg = await (await ctx.fetch(`${GMAIL_API}/messages/${id}?format=full`, opts())).json();
     } catch (err) {
       console.warn(`gmail replies: failed to fetch message ${id}: ${err.message}`);
       continue;
@@ -395,20 +431,25 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
     const from = header(headers, 'from');
     if (!isAuthenticEmail(headers)) {
       processed.add(id); // fail closed: an unauthenticated reply is never proposed
+      unmatched.delete(id);
       continue;
     }
     const body = plain(getMessageBody(msg.payload) || msg.snippet || '');
     const signal = classifyReply({ subject, body });
-    if (!signal) { processed.add(id); continue; }
+    if (!signal) { processed.add(id); unmatched.delete(id); continue; }
     const { row, reason } = matchApplication(rows, { from, subject, body });
     if (!row) {
       // Not marked processed: a row added later can still match it while the
-      // message is inside the search window.
+      // message is inside the search window, so it is tried again once the
+      // tracker changes.
+      unmatched.delete(id);
+      unmatched.set(id, trackerDigest);
       ctx.log(`gmail replies: ${signal.to} reply not proposed: ${reason}`);
       continue;
     }
     const fromId = /** @type {string} */ (statusId(row.status));
     processed.add(id);
+    unmatched.delete(id);
     if (!isForward(fromId, signal.to)) continue;
     const proposal = buildProposal({
       account, messageId: id, trackerPath, row, from: fromId, to: signal.to, evidence: signal.evidence,
@@ -422,7 +463,7 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
     written++;
   }
 
-  if (!ctx?.dryRun) saveState(statePath, processed);
+  if (!ctx?.dryRun) saveState(statePath, state);
   if (written || refreshed) ctx.log('gmail replies: review with `node reply-watch.mjs`; nothing changes until you accept');
   return { proposals: written, refreshed, scanned };
 }

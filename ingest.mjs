@@ -31,6 +31,10 @@ import { scanReplies } from './_replies.mjs';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const STATE_FILE = join('data', 'gmail-state.json'); // the plugin's own processed-id cursor
+// The engine stops an ingest hook after 15 seconds and then drops what it
+// returns. The reply scan stops starting requests at this point of the hook, so
+// the leads fetched first always come back; unread replies wait for the next run.
+export const REPLY_DEADLINE_MS = 11_000;
 
 // The cursor is user-layer data, so it lives under the data root (ctx.dataRoot)
 // like the pipeline the engine writes these leads to. A ctx that carries no
@@ -95,6 +99,7 @@ function saveProcessedIds(ids, ctx) {
 /** @type {{ ingest: (ctx: any) => Promise<object[]> }} */
 export default {
   async ingest(ctx) {
+    const started = Date.now();
     const clientId = ctx?.env?.GMAIL_CLIENT_ID;
     const clientSecret = ctx?.env?.GMAIL_CLIENT_SECRET;
     const refreshToken = ctx?.env?.GMAIL_REFRESH_TOKEN;
@@ -123,6 +128,7 @@ export default {
         await scanReplies(ctx, auth, {
           daysBack: repliesDaysBack,
           trackerOverride: process.env.CAREER_OPS_TRACKER?.trim() || '',
+          deadline: started + REPLY_DEADLINE_MS,
         });
       } catch (err) {
         // The lead cursor is already saved, so throwing here would lose the

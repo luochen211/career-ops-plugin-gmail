@@ -7,7 +7,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import plugin from '../index.mjs';
 import {
-  accountId, buildQuery, classifyReply, isForward, matchApplication, parseTracker, statusId,
+  accountId, buildQuery, classifyReply, isForward, matchApplication, parseTracker, scanReplies, statusId,
 } from '../_replies.mjs';
 
 const assert = assertModule.strict;
@@ -233,6 +233,59 @@ test('a stale proposal is re-pointed at the current status until accepted', asyn
   setRow1('Assessment', `[reply-proposal:${digest}]`);
   await plugin.ingest(ctx());
   assert.equal(drop().from_status, 'responded', 'an accepted source is never re-proposed');
+});
+
+test('the reply scan stops at the deadline and the leads still come back', async () => {
+  const lead = message('18f0eee', {
+    subject: 'Data Engineer at Acme',
+    from: 'jobs@acme.com',
+    body: 'Apply here: https://boards.greenhouse.io/acme/jobs/456',
+  });
+  const { ctx, calls } = setup([lead, INVITE]);
+  const base = ctx();
+  const realNow = Date.now;
+  let skew = 0;
+  const fetch = async (url, init) => {
+    const res = await base.fetch(url, init);
+    // Leads take the whole budget: the clock jumps once their search returns.
+    if (url.includes('label%3A')) skew = 20_000;
+    return res;
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    const jobs = await plugin.ingest(ctx({ settings: { replies: true }, fetch }));
+    assert.deepEqual(jobs.map(j => j.url), ['https://boards.greenhouse.io/acme/jobs/456']);
+  } finally { Date.now = realNow; }
+  assert.ok(!calls.some(u => u.endsWith('/profile')), 'no reply request starts after the deadline');
+});
+
+test('every reply request is cut to the time left', async () => {
+  const { root, ctx } = setup([INVITE]);
+  const seen = [];
+  const base = ctx();
+  const fetch = async (url, init) => { seen.push(init?.timeoutMs); return base.fetch(url, init); };
+  await scanReplies(ctx({ fetch }), {}, { daysBack: 30, deadline: Date.now() + 3_000 });
+  assert.ok(seen.length >= 3);
+  assert.ok(seen.every(t => t > 0 && t <= 3_000), String(seen));
+  assert.ok(root);
+});
+
+test('an unmatched reply is not fetched again until the tracker changes', async () => {
+  const stray = message('18f0fff', {
+    subject: 'Globex: interview invitation',
+    from: 'talent@globex.com',
+    body: 'We would like to invite you to an interview.',
+  });
+  const { root, ctx, calls } = setup([stray]);
+  const fetched = () => calls.filter(u => u.includes('/messages/18f0fff')).length;
+  await plugin.ingest(ctx());
+  assert.equal(fetched(), 1);
+  await plugin.ingest(ctx());
+  assert.equal(fetched(), 1, 'same tracker: skipped without using the cap');
+  writeFileSync(path.join(root, 'data', 'applications.md'),
+    TRACKER.replace('| 4 | 2026-06-23 | Meta |', '| 4 | 2026-06-23 | Globex |'));
+  await plugin.ingest(ctx());
+  assert.equal(fetched(), 2, 'tracker changed: tried again');
 });
 
 let failed = 0;
