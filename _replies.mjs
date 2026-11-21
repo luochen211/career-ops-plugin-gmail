@@ -10,7 +10,7 @@
 
 import { createHash } from 'node:crypto';
 import {
-  existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { getMessageBody, isAuthenticEmail } from './_helpers.mjs';
@@ -290,6 +290,45 @@ function writeProposal(dir, proposal) {
   return final;
 }
 
+/**
+ * Re-point this account's unaccepted proposals at the row's current status.
+ * reply-watch skips a proposal whose from_status no longer matches the row, and
+ * its message is already processed, so without this the reply is never offered
+ * again. The drop file is keyed by source identity, so rewriting it replaces
+ * the stale payload. Accepted sources (a receipt in the tracker) are left alone.
+ */
+function refreshStaleProposals(ctx, { dropDir, account, rows, trackerText, trackerPath }) {
+  let names = [];
+  try { names = readdirSync(dropDir).filter(n => /^gmail-[0-9a-f]{24}\.json$/.test(n)); } catch { return 0; }
+  let refreshed = 0;
+  for (const name of names) {
+    const file = join(dropDir, name);
+    let p;
+    try {
+      if (!lstatSync(file).isFile()) continue;
+      p = JSON.parse(readFileSync(file, 'utf-8'));
+    } catch { continue; }
+    if (p?.schema_version !== 1 || p.source?.kind !== 'gmail' || p.source.account_id !== account) continue;
+    const digest = sha256(JSON.stringify(['gmail', account, p.source.message_id]));
+    if (trackerText.includes(`[reply-proposal:${digest}]`)) continue;
+    const a = p.application || {};
+    const row = rows.find(r => r.num === a.num && r.date === a.date && r.company === a.company
+      && r.role === a.role && r.report === a.report);
+    const current = row && statusId(row.status);
+    if (!current || current === p.from_status || !isForward(current, p.to_status)) continue;
+    if (ctx?.dryRun) {
+      ctx.log(`gmail replies: would refresh #${row.num} ${STATES[current]} → ${STATES[p.to_status]}`);
+    } else {
+      writeProposal(dropDir, buildProposal({
+        account, messageId: p.source.message_id, trackerPath, row, from: current, to: p.to_status, evidence: p.evidence,
+      }));
+      ctx.log(`gmail replies: refreshed #${row.num} ${STATES[current]} → ${STATES[p.to_status]}`);
+    }
+    refreshed++;
+  }
+  return refreshed;
+}
+
 const header = (headers, name) => headers.find(h => h.name?.toLowerCase() === name)?.value || '';
 const plain = (html) => String(html).replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, ' ')
   .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/li>|<\/tr>/gi, '\n').replace(/<[^>]+>/g, ' ')
@@ -309,7 +348,8 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
     ctx.log(`gmail replies: no tracker at ${trackerPath}; nothing to match`);
     return { proposals: 0, scanned: 0 };
   }
-  const rows = parseTracker(readFileSync(trackerPath, 'utf-8'));
+  const trackerText = readFileSync(trackerPath, 'utf-8');
+  const rows = parseTracker(trackerText);
   if (!rows.some(r => ACTIVE.includes(statusId(r.status) || ''))) {
     ctx.log('gmail replies: no application is waiting on an employer');
     return { proposals: 0, scanned: 0 };
@@ -322,6 +362,7 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
   const statePath = join(dataRoot, STATE_FILE);
   const processed = loadState(statePath);
   const dropDir = join(dataRoot, DROP_DIR);
+  const refreshed = refreshStaleProposals(ctx, { dropDir, account, rows, trackerText, trackerPath });
 
   // The cap counts messages still to read, so processed ones never use it up.
   const query = buildQuery(rows, daysBack);
@@ -382,6 +423,6 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
   }
 
   if (!ctx?.dryRun) saveState(statePath, processed);
-  if (written) ctx.log('gmail replies: review with `node reply-watch.mjs`; nothing changes until you accept');
-  return { proposals: written, scanned };
+  if (written || refreshed) ctx.log('gmail replies: review with `node reply-watch.mjs`; nothing changes until you accept');
+  return { proposals: written, refreshed, scanned };
 }

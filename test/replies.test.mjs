@@ -4,6 +4,7 @@ import assertModule from 'node:assert';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import plugin from '../index.mjs';
 import {
   accountId, buildQuery, classifyReply, isForward, matchApplication, parseTracker, statusId,
@@ -205,6 +206,33 @@ test('already processed mail does not use up the scan cap', async () => {
     JSON.stringify({ processed_message_ids: old.map(m => m.id) }));
   await plugin.ingest(ctx());
   assert.equal(drops().length, 1);
+});
+
+test('a stale proposal is re-pointed at the current status until accepted', async () => {
+  const { root, ctx, drops } = setup([INVITE]);
+  const tracker = path.join(root, 'data', 'applications.md');
+  const drop = () => JSON.parse(readFileSync(path.join(root, 'data', 'reply-proposals', drops()[0]), 'utf8'));
+  const setRow1 = (status, notes = '') => writeFileSync(tracker, TRACKER.replace(
+    '| PY01_python开发工程师 | 4.1/5 | Applied | ❌ | — | |', `| PY01_python开发工程师 | 4.1/5 | ${status} | ❌ | — | ${notes} |`));
+  await plugin.ingest(ctx());
+  assert.equal(drop().from_status, 'applied');
+
+  setRow1('Responded');
+  await plugin.ingest(ctx({ dryRun: true }));
+  assert.equal(drop().from_status, 'applied', 'a dry run rewrites nothing');
+  await plugin.ingest(ctx());
+  assert.equal(drops().length, 1);
+  assert.equal(drop().from_status, 'responded');
+  assert.equal(drop().to_status, 'interview');
+
+  setRow1('Rejected');
+  await plugin.ingest(ctx());
+  assert.equal(drop().from_status, 'responded', 'no longer a forward move: left as it was');
+
+  const digest = createHash('sha256').update(JSON.stringify(['gmail', accountId('me@example.com'), '18f0aaa'])).digest('hex');
+  setRow1('Assessment', `[reply-proposal:${digest}]`);
+  await plugin.ingest(ctx());
+  assert.equal(drop().from_status, 'responded', 'an accepted source is never re-proposed');
 });
 
 let failed = 0;
