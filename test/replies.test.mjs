@@ -319,6 +319,30 @@ test('slow listing still gets through the pages it reached', async () => {
   assert.ok(lists <= 3, `listing stopped at the deadline (${lists} pages)`);
 });
 
+test('a failed later page keeps the decisions made before it', async () => {
+  const { root, ctx, drops } = setup([INVITE]);
+  const base = ctx();
+  const fetch = async (url, init) => {
+    if (url.includes('/messages?q=')) {
+      if (url.includes('pageToken')) throw new Error('page 2 503');
+      return { ok: true, json: async () => ({ messages: [{ id: INVITE.id }], nextPageToken: '2' }) };
+    }
+    return base.fetch(url, init);
+  };
+  await assert.rejects(scanReplies(ctx({ fetch }), {}, { daysBack: 30 }), /page 2 503/);
+  assert.equal(drops().length, 1);
+  const state = JSON.parse(readFileSync(path.join(root, 'data', 'gmail-replies-state.json'), 'utf8'));
+  assert.deepEqual(state.processed_message_ids, [INVITE.id]);
+});
+
+test('a message whose proposal could not be written is not marked processed', async () => {
+  const { root, ctx } = setup([INVITE]);
+  writeFileSync(path.join(root, 'data', 'reply-proposals'), 'not a directory');
+  await assert.rejects(scanReplies(ctx(), {}, { daysBack: 30 }));
+  const state = JSON.parse(readFileSync(path.join(root, 'data', 'gmail-replies-state.json'), 'utf8'));
+  assert.deepEqual(state.processed_message_ids, []);
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {
