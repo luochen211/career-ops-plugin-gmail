@@ -288,6 +288,37 @@ test('an unmatched reply is not fetched again until the tracker changes', async 
   assert.equal(fetched(), 2, 'tracker changed: tried again');
 });
 
+test('slow listing still gets through the pages it reached', async () => {
+  const { ctx, drops } = setup([INVITE]);
+  const base = ctx();
+  const realNow = Date.now;
+  const start = realNow();
+  let skew = 0;
+  let lists = 0;
+  const fetch = async (url, init) => {
+    if (url.includes('/messages?q=')) {
+      lists++;
+      skew += 4_000; // every page takes four seconds to list
+      const page = url.includes('pageToken') ? Number(url.split('pageToken=')[1]) : 1;
+      return { ok: true, json: async () => (page === 1
+        ? { messages: [{ id: INVITE.id }], nextPageToken: '2' }
+        : { messages: [{ id: `later${page}` }], nextPageToken: String(page + 1) }) };
+    }
+    const later = url.match(/\/messages\/(later\d+)/);
+    if (later) {
+      const m = message(later[1], { subject: 'Newsletter', from: 'news@example.com', body: 'Weekly news.' });
+      return { ok: true, json: async () => m };
+    }
+    return base.fetch(url, init);
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    await scanReplies(ctx({ fetch }), {}, { daysBack: 30, deadline: start + 11_000 });
+  } finally { Date.now = realNow; }
+  assert.equal(drops().length, 1, 'the first page was read before listing went on');
+  assert.ok(lists <= 3, `listing stopped at the deadline (${lists} pages)`);
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {

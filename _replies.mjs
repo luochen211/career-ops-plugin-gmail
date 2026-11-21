@@ -396,72 +396,73 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '', d
   // The cap counts messages still to decide: processed ones, and unmatched ones
   // already tried against this tracker, never use it up.
   const query = buildQuery(rows, daysBack);
-  const ids = [];
+  let written = 0;
+  let scanned = 0;
+  let taken = 0;
   let pageToken = null;
-  do {
-    if (left() < MIN_LEFT_MS) break;
+  let outOfTime = false;
+  // Each page is read before the next is listed, so a run that runs out of
+  // time still records what it got through.
+  pages: do {
+    if (left() < MIN_LEFT_MS) { outOfTime = true; break; }
     let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
     if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
     const data = await (await ctx.fetch(url, opts())).json();
-    for (const m of data.messages || []) {
-      if (processed.has(m.id) || unmatched.get(m.id) === trackerDigest) continue;
-      if (/^[A-Za-z0-9_-]{1,256}$/.test(m.id)) ids.push(m.id);
-    }
     pageToken = data.nextPageToken;
-  } while (pageToken && ids.length < MAX_MESSAGES);
-
-  let written = 0;
-  let scanned = 0;
-
-  for (const id of ids.slice(0, MAX_MESSAGES)) {
-    if (left() < MIN_LEFT_MS) {
-      ctx.log('gmail replies: out of time; the remaining messages are scanned next run');
-      break;
-    }
-    let msg;
-    try {
-      msg = await (await ctx.fetch(`${GMAIL_API}/messages/${id}?format=full`, opts())).json();
-    } catch (err) {
-      console.warn(`gmail replies: failed to fetch message ${id}: ${err.message}`);
-      continue;
-    }
-    scanned++;
-    const headers = msg.payload?.headers || [];
-    const subject = header(headers, 'subject');
-    const from = header(headers, 'from');
-    if (!isAuthenticEmail(headers)) {
-      processed.add(id); // fail closed: an unauthenticated reply is never proposed
+    for (const m of data.messages || []) {
+      const id = m.id;
+      if (processed.has(id) || unmatched.get(id) === trackerDigest) continue;
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(id)) continue;
+      if (taken >= MAX_MESSAGES) break pages;
+      if (left() < MIN_LEFT_MS) { outOfTime = true; break pages; }
+      taken++;
+      let msg;
+      try {
+        msg = await (await ctx.fetch(`${GMAIL_API}/messages/${id}?format=full`, opts())).json();
+      } catch (err) {
+        console.warn(`gmail replies: failed to fetch message ${id}: ${err.message}`);
+        continue;
+      }
+      if (!msg || typeof msg !== 'object') continue;
+      scanned++;
+      const headers = msg.payload?.headers || [];
+      const subject = header(headers, 'subject');
+      const from = header(headers, 'from');
+      if (!isAuthenticEmail(headers)) {
+        processed.add(id); // fail closed: an unauthenticated reply is never proposed
+        unmatched.delete(id);
+        continue;
+      }
+      const body = plain(getMessageBody(msg.payload) || msg.snippet || '');
+      const signal = classifyReply({ subject, body });
+      if (!signal) { processed.add(id); unmatched.delete(id); continue; }
+      const { row, reason } = matchApplication(rows, { from, subject, body });
+      if (!row) {
+        // Not marked processed: a row added later can still match it while the
+        // message is inside the search window, so it is tried again once the
+        // tracker changes.
+        unmatched.delete(id);
+        unmatched.set(id, trackerDigest);
+        ctx.log(`gmail replies: ${signal.to} reply not proposed: ${reason}`);
+        continue;
+      }
+      const fromId = /** @type {string} */ (statusId(row.status));
+      processed.add(id);
       unmatched.delete(id);
-      continue;
+      if (!isForward(fromId, signal.to)) continue;
+      const proposal = buildProposal({
+        account, messageId: id, trackerPath, row, from: fromId, to: signal.to, evidence: signal.evidence,
+      });
+      if (ctx?.dryRun) {
+        ctx.log(`gmail replies: would propose #${row.num} ${STATES[fromId]} → ${STATES[signal.to]}`);
+      } else {
+        writeProposal(dropDir, proposal);
+        ctx.log(`gmail replies: proposed #${row.num} ${STATES[fromId]} → ${STATES[signal.to]}`);
+      }
+      written++;
     }
-    const body = plain(getMessageBody(msg.payload) || msg.snippet || '');
-    const signal = classifyReply({ subject, body });
-    if (!signal) { processed.add(id); unmatched.delete(id); continue; }
-    const { row, reason } = matchApplication(rows, { from, subject, body });
-    if (!row) {
-      // Not marked processed: a row added later can still match it while the
-      // message is inside the search window, so it is tried again once the
-      // tracker changes.
-      unmatched.delete(id);
-      unmatched.set(id, trackerDigest);
-      ctx.log(`gmail replies: ${signal.to} reply not proposed: ${reason}`);
-      continue;
-    }
-    const fromId = /** @type {string} */ (statusId(row.status));
-    processed.add(id);
-    unmatched.delete(id);
-    if (!isForward(fromId, signal.to)) continue;
-    const proposal = buildProposal({
-      account, messageId: id, trackerPath, row, from: fromId, to: signal.to, evidence: signal.evidence,
-    });
-    if (ctx?.dryRun) {
-      ctx.log(`gmail replies: would propose #${row.num} ${STATES[fromId]} → ${STATES[signal.to]}`);
-    } else {
-      writeProposal(dropDir, proposal);
-      ctx.log(`gmail replies: proposed #${row.num} ${STATES[fromId]} → ${STATES[signal.to]}`);
-    }
-    written++;
-  }
+  } while (pageToken);
+  if (outOfTime) ctx.log('gmail replies: out of time; the remaining messages are scanned next run');
 
   if (!ctx?.dryRun) saveState(statePath, state);
   if (written || refreshed) ctx.log('gmail replies: review with `node reply-watch.mjs`; nothing changes until you accept');
