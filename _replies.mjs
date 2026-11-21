@@ -319,6 +319,11 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
   if (!profile.emailAddress) throw new Error('gmail replies: Gmail profile returned no address');
   const account = accountId(profile.emailAddress);
 
+  const statePath = join(dataRoot, STATE_FILE);
+  const processed = loadState(statePath);
+  const dropDir = join(dataRoot, DROP_DIR);
+
+  // The cap counts messages still to read, so processed ones never use it up.
   const query = buildQuery(rows, daysBack);
   const ids = [];
   let pageToken = null;
@@ -326,18 +331,16 @@ export async function scanReplies(ctx, auth, { daysBack, trackerOverride = '' })
     let url = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}`;
     if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
     const data = await (await ctx.fetch(url, { headers: auth })).json();
-    for (const m of data.messages || []) ids.push(m.id);
+    for (const m of data.messages || []) {
+      if (!processed.has(m.id) && /^[A-Za-z0-9_-]{1,256}$/.test(m.id)) ids.push(m.id);
+    }
     pageToken = data.nextPageToken;
   } while (pageToken && ids.length < MAX_MESSAGES);
 
-  const statePath = join(dataRoot, STATE_FILE);
-  const processed = loadState(statePath);
-  const dropDir = join(dataRoot, DROP_DIR);
   let written = 0;
   let scanned = 0;
 
   for (const id of ids.slice(0, MAX_MESSAGES)) {
-    if (processed.has(id) || !/^[A-Za-z0-9_-]{1,256}$/.test(id)) continue;
     let msg;
     try {
       msg = await (await ctx.fetch(`${GMAIL_API}/messages/${id}?format=full`, { headers: auth })).json();

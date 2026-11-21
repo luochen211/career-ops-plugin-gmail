@@ -198,6 +198,15 @@ test('a failed reply scan keeps the leads fetched in the same run', async () => 
   await assert.rejects(plugin.ingest(ctx({ fetch })), /profile 503/, 'replies-only still fails loudly');
 });
 
+test('already processed mail does not use up the scan cap', async () => {
+  const old = Array.from({ length: 250 }, (_, i) => ({ id: `old${i}` }));
+  const { root, ctx, drops } = setup([...old, INVITE]);
+  writeFileSync(path.join(root, 'data', 'gmail-replies-state.json'),
+    JSON.stringify({ processed_message_ids: old.map(m => m.id) }));
+  await plugin.ingest(ctx());
+  assert.equal(drops().length, 1);
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {
