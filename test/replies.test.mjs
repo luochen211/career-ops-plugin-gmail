@@ -177,6 +177,27 @@ test('replies stay off unless enabled', async () => {
   assert.ok(!calls.some(u => u.endsWith('/profile')));
 });
 
+test('a failed reply scan keeps the leads fetched in the same run', async () => {
+  const lead = message('18f0ddd', {
+    subject: 'Data Engineer at Acme',
+    from: 'jobs@acme.com',
+    body: 'Apply here: https://boards.greenhouse.io/acme/jobs/123',
+  });
+  const { ctx } = setup([lead]);
+  const base = ctx();
+  const fetch = async (url, init) => {
+    if (url.endsWith('/profile')) throw new Error('profile 503');
+    return base.fetch(url, init);
+  };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const jobs = await plugin.ingest(ctx({ settings: { replies: true }, fetch }));
+    assert.deepEqual(jobs.map(j => j.url), ['https://boards.greenhouse.io/acme/jobs/123']);
+  } finally { console.warn = warn; }
+  await assert.rejects(plugin.ingest(ctx({ fetch })), /profile 503/, 'replies-only still fails loudly');
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {

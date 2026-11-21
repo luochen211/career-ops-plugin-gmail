@@ -119,10 +119,17 @@ export default {
     const auth = { Authorization: `Bearer ${token}` };
     const jobs = leads ? await ingestLeads(ctx, auth, label, daysBack) : [];
     if (replies) {
-      await scanReplies(ctx, auth, {
-        daysBack: repliesDaysBack,
-        trackerOverride: process.env.CAREER_OPS_TRACKER?.trim() || '',
-      });
+      try {
+        await scanReplies(ctx, auth, {
+          daysBack: repliesDaysBack,
+          trackerOverride: process.env.CAREER_OPS_TRACKER?.trim() || '',
+        });
+      } catch (err) {
+        // The lead cursor is already saved, so throwing here would lose the
+        // leads fetched above. Keep them and report the failed reply scan.
+        if (!leads) throw err;
+        console.warn(`gmail: reply scan failed, leads kept — ${err.message}`);
+      }
     }
     return jobs;
   },
